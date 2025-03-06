@@ -106,6 +106,7 @@ pub struct WorkerGuard {
     handle: Option<JoinHandle<()>>,
     sender: Sender<Msg>,
     shutdown: Sender<()>,
+    shutdown_timeout: Duration,
 }
 
 /// A non-blocking writer.
@@ -155,6 +156,7 @@ impl NonBlocking {
         buffered_lines_limit: usize,
         is_lossy: bool,
         thread_name: String,
+        shutdown_timeout: Duration,
     ) -> (NonBlocking, WorkerGuard) {
         let (sender, receiver) = bounded(buffered_lines_limit);
 
@@ -165,6 +167,7 @@ impl NonBlocking {
             worker.worker_thread(thread_name),
             sender.clone(),
             shutdown_sender,
+            shutdown_timeout,
         );
 
         (
@@ -192,6 +195,7 @@ pub struct NonBlockingBuilder {
     buffered_lines_limit: usize,
     is_lossy: bool,
     thread_name: String,
+    shutdown_timeout: Duration,
 }
 
 impl NonBlockingBuilder {
@@ -227,7 +231,19 @@ impl NonBlockingBuilder {
             self.buffered_lines_limit,
             self.is_lossy,
             self.thread_name,
+            self.shutdown_timeout,
         )
+    }
+
+    /// Sets the timeout for shutdown of the worker thread.
+    /// 
+    /// This is the maximum amount of time the main thread will wait
+    /// for the worker thread to finish proccessing pending logs during shutdown
+    /// 
+    /// The default timeout is 1 second.
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> NonBlockingBuilder {
+        self.shutdown_timeout = timeout;
+        self
     }
 }
 
@@ -237,6 +253,7 @@ impl Default for NonBlockingBuilder {
             buffered_lines_limit: DEFAULT_BUFFERED_LINES_LIMIT,
             is_lossy: true,
             thread_name: "tracing-appender".to_string(),
+            shutdown_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -276,11 +293,17 @@ impl<'a> MakeWriter<'a> for NonBlocking {
 }
 
 impl WorkerGuard {
-    fn new(handle: JoinHandle<()>, sender: Sender<Msg>, shutdown: Sender<()>) -> Self {
+    fn new(
+        handle: JoinHandle<()>,
+        sender: Sender<Msg>,
+        shutdown: Sender<()>,
+        shutdown_timeout: Duration
+    ) -> Self {
         WorkerGuard {
             handle: Some(handle),
             sender,
             shutdown,
+            shutdown_timeout,
         }
     }
 }
@@ -294,12 +317,11 @@ impl Drop for WorkerGuard {
                 // when the `Worker` calls `recv()` on a zero-capacity channel. Use `send_timeout`
                 // so that drop is not blocked indefinitely.
                 // TODO: Make timeout configurable.
-                let timeout = Duration::from_millis(1000);
-                match self.shutdown.send_timeout((), timeout) {
+                match self.shutdown.send_timeout((), self.shutdown_timeout) {
                     Err(SendTimeoutError::Timeout(_)) => {
                         eprintln!(
                             "Shutting down logging worker timed out after {:?}.",
-                            timeout
+                            self.shutdown_timeout
                         );
                     }
                     _ => {
